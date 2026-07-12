@@ -41,15 +41,73 @@ def get_cv_splits(groups, n_batches):
 
 # ── 批次聚合 ──────────────────────────────────────────────────────────────────
 
-def aggregate_to_batch(preds, names):
+def _remove_outliers(values, method):
     """
-    同批次多条光谱的预测值 → 取中位数作为批次预测。
-    中位数比均值对异常光谱更鲁棒。
+    对一批次的预测值列表执行异常值剔除，返回过滤后的 numpy 数组。
+
+    参数
+    ----------
+    values : list[float]
+    method : str or None
+        可选方法:
+          - None / 'none'     : 不剔除
+          - 'zscore-2'        : Z分数 |z| > 2 剔除
+          - 'zscore-1.5'      : Z分数 |z| > 1.5 剔除
+          - 'modified-zscore' : 修正Z分数(MAD基准) |M| > 3.5 剔除
+          - 'iqr'             : 四分位距法 [Q1-1.5*IQR, Q3+1.5*IQR] 外剔除
+    """
+    arr = np.array(values, dtype=np.float64)
+    n = len(arr)
+    if n < 4 or method is None or method == 'none':
+        return arr
+
+    if method in ('zscore-2', 'zscore-1.5'):
+        threshold = 2.0 if method == 'zscore-2' else 1.5
+        mean, std = np.mean(arr), np.std(arr, ddof=0)
+        if std == 0.0:
+            return arr
+        return arr[np.abs((arr - mean) / std) <= threshold]
+
+    elif method == 'modified-zscore':
+        median = np.median(arr)
+        mad = np.median(np.abs(arr - median))
+        if mad == 0.0:
+            return arr
+        # 修正Z分数: M_i = 0.6745 * (x_i - median) / MAD
+        mod_z = 0.6745 * (arr - median) / mad
+        return arr[np.abs(mod_z) <= 3.5]
+
+    elif method == 'iqr':
+        q1, q3 = np.percentile(arr, [25, 75])
+        iqr = q3 - q1
+        if iqr == 0.0:
+            return arr
+        lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        return arr[(arr >= lower) & (arr <= upper)]
+
+    else:
+        raise ValueError(f"未知的异常值剔除方法: {method}")
+
+
+def aggregate_to_batch(preds, names, outlier_method='none'):
+    """
+    同批次多条光谱的预测值 → 剔除异常值 → 取中位数作为批次预测。
+
+    参数
+    ----------
+    preds : array-like
+    names : list[str]
+    outlier_method : str or None
+        异常值剔除策略，传入 _remove_outliers 的 method 参数。
+        默认为 'none'（不剔除，保持原有行为）。
     """
     grouped = {}
     for p, n in zip(preds, names):
         grouped.setdefault(n, []).append(p)
-    return {k: float(np.median(v)) for k, v in grouped.items()}
+    return {
+        k: float(np.median(_remove_outliers(v, outlier_method)))
+        for k, v in grouped.items()
+    }
 
 
 # ── 均值收缩搜索 ──────────────────────────────────────────────────────────────
