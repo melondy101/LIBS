@@ -3,6 +3,7 @@
 
 流程:
   1. 加载标签
+  1.5 预训练嵌入模型 (AE/MAE/VAE/Contrastive)
   2. 按煤种分别训练两阶段模型
   3. 记录实验日志（timestamp + CV-RMSE）
   4. 测试集推理
@@ -37,6 +38,35 @@ def main():
     label_map, aux_map = load_labels()
     print(f"  标签总数: {len(label_map)}")
 
+    # ── Step 1.5: 预训练 AE Embedder ──────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Step 1.5: 预训练 Autoencoder Embedder")
+
+    from src.features import compute_features
+    from src.embed import AutoencoderEmbedder
+
+    # 收集所有训练集光谱用于无监督预训练
+    all_inorms = []
+    for coal_type in COAL_TYPES:
+        train_data = load_coal_spectra(TRAIN_DIR, coal_type, label_map, aux_map)
+        if train_data is None or train_data['n_batches'] == 0:
+            continue
+        inorm_mat = compute_features(train_data)
+        all_inorms.append(inorm_mat)
+
+    if all_inorms:
+        X_pretrain = np.vstack(all_inorms)
+        from sklearn.preprocessing import StandardScaler
+        scaler_pretrain = StandardScaler()
+        X_pretrain_scaled = scaler_pretrain.fit_transform(X_pretrain)
+
+        input_dim = X_pretrain_scaled.shape[1]
+        print(f"  预训练数据形状: {X_pretrain_scaled.shape}, 输入维度: {input_dim}")
+        global_embedder = AutoencoderEmbedder(input_dim=input_dim, embed_dim=30)
+        global_embedder.fit(X_pretrain_scaled, epochs=150)
+    else:
+        global_embedder = None
+
     # ── Step 2: 按煤种训练 ────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("Step 2: 两阶段训练（分煤种）")
@@ -51,7 +81,7 @@ def main():
             print(f"\n  [{coal_type}] 未找到训练数据，跳过")
             continue
 
-        model_dict = train_coal_model(coal_type, train_data)
+        model_dict = train_coal_model(coal_type, train_data, embedder=global_embedder)
         models[coal_type]      = model_dict
         cv_results[coal_type]  = model_dict['cv_rmse']
         n_batches_l.append(train_data['n_batches'])
