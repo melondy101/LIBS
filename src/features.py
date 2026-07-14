@@ -16,36 +16,17 @@ from sklearn.preprocessing import StandardScaler
 from config import KEY_LINES, RANDOM_STATE
 
 
-# ── 谱线积分 ──────────────────────────────────────────────────────────────────
-
 def line_integral(wl, inten, center_nm, halfwin_nm):
-    """
-    对 [center-halfwin, center+halfwin] 窗口内的强度求和。
-    用于提取特定元素的发射谱线强度。
-    """
     mask = (wl >= center_nm - halfwin_nm) & (wl <= center_nm + halfwin_nm)
     return float(inten[mask].sum()) if mask.sum() > 0 else 0.0
 
 
-# ── 单条光谱特征 ──────────────────────────────────────────────────────────────
-
 def spectrum_features(wl, inten):
-    """
-    从一条光谱提取三层特征。
-
-    返回:
-        inorm  (D,)   : 强度归一化（用于嵌入降维）
-        stats  (17,)  : 统计特征
-        labs   (11,)  : 谱线绝对积分
-        lrel   (11,)  : 谱线相对积分
-        rats   (4,)   : 物理比值
-    """
     total      = inten.sum() + 1e-8
-    inten_norm = inten / total          # 归一化强度（消除激光能量波动）
-    deriv      = np.diff(inten_norm)    # 一阶差分
-    deriv2     = np.diff(inten_norm, 2) # 二阶差分
+    inten_norm = inten / total
+    deriv      = np.diff(inten_norm)
+    deriv2     = np.diff(inten_norm, 2)
 
-    # 统计特征: 描述整体光谱形状
     stats = np.array([
         inten.mean(), inten.std(), inten.max(), np.log1p(total),
         inten_norm.mean(), inten_norm.std(),
@@ -58,34 +39,26 @@ def spectrum_features(wl, inten):
         deriv2.std(), float(np.abs(deriv2).mean()),
     ], dtype=np.float32)
 
-    # 谱线特征: 物理意义最强的部分
     line_names = list(KEY_LINES.keys())
     labs = np.array(
         [line_integral(wl, inten, c, h) for _, (c, h) in KEY_LINES.items()],
         dtype=np.float32
     )
-    lrel = labs / total   # 相对强度（消除光谱总能量差异）
+    lrel = labs / total
 
-    # 物理比值: 可燃元素 vs 灰分元素
-    comb_sum = labs[[0, 1, 2, 3]].sum()                        # 可燃元素
-    ash_sum  = labs[[4, 5, 6, 7, 8, 9]].sum() + 1e-8          # 灰分元素
+    comb_sum = labs[[0, 1, 2, 3]].sum()
+    ash_sum  = labs[[4, 5, 6, 7, 8, 9]].sum() + 1e-8
     rats = np.array([
-        comb_sum / ash_sum,                 # 可燃/灰分 (发热量代理)
-        labs[1] / ash_sum,                  # H/灰分
-        labs[0] / ash_sum,                  # C/灰分
-        labs[1] / (labs[0] + 1e-8),        # H/C
+        comb_sum / ash_sum,
+        labs[1] / ash_sum,
+        labs[0] / ash_sum,
+        labs[1] / (labs[0] + 1e-8),
     ], dtype=np.float32)
 
     return inten_norm, stats, labs, lrel, rats
 
 
-# ── 批量特征计算 ──────────────────────────────────────────────────────────────
-
 def compute_features(data):
-    """
-    对 data_dict 中所有光谱计算特征，原地填充 stats/labs/lrel/rats 字段。
-    同时返回归一化光谱矩阵（用于嵌入降维）。
-    """
     raw_spectra = data['spectra']
     inorms, stats_list, labs_list, lrel_list, rats_list = [], [], [], [], []
 
@@ -97,7 +70,6 @@ def compute_features(data):
         lrel_list.append(lrel)
         rats_list.append(rats)
 
-    # 裁剪到最短公共波长（不同仪器/文件行数可能略有差异）
     min_len = min(len(s) for s in inorms)
     inorm_mat = np.array([s[:min_len] for s in inorms], dtype=np.float32)
 
@@ -109,29 +81,20 @@ def compute_features(data):
     return inorm_mat
 
 
-# ── 嵌入降维 + 拼接 ──────────────────────────────────────────────────────────
-
 def build_feature_matrix(data, n_batches,
                          scaler_spec=None, embedder=None, scaler_hand=None, fit=True):
-    """
-    构建最终特征矩阵: [嵌入降维(归一化光谱)] + [手工特征]。
-
-    embedder: 对象必须实现 .fit(X) / .transform(X) / .fit_transform(X)
-              (PCA、AE、MAE、VAE、Contrastive 均可)
-
-    fit=True  : 用训练数据拟合 scaler/embedder，返回 (X, scaler_spec, embedder, scaler_hand)
-    fit=False : 用已拟合的 scaler/embedder 变换测试数据，返回 X
-    """
     inorm_mat = compute_features(data)
 
     if fit:
         scaler_spec = StandardScaler()
         spec_scaled = scaler_spec.fit_transform(inorm_mat)
-        spec_embed = embedder.fit_transform(spec_scaled)
+        if embedder.fitted:
+            spec_embed = embedder.transform(spec_scaled)
+        else:
+            spec_embed = embedder.fit_transform(spec_scaled)
     else:
         spec_embed = embedder.transform(scaler_spec.transform(inorm_mat))
 
-    # 拼接手工特征
     hand_feats = np.hstack([data['stats'], data['labs'], data['lrel'], data['rats']])
     X = np.hstack([spec_embed, hand_feats])
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
