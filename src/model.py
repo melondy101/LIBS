@@ -54,118 +54,134 @@ def aggregate_to_batch(preds, names):
 
 # ── 均值收缩搜索 ──────────────────────────────────────────────────────────────
 
-def find_best_shrinkage(oof_preds, oof_true, coal_mean):
+def _search_shrink_w(oof_preds, targets, groups, coal_mean, w_candidates):
     """
-    在 [0, 1] 上网格搜索混合权重 w，最小化 OOF-RMSE。
-    w=1.0 代表纯模型，w=0.0 代表纯均值。
+    在 OOF 验证集上搜索最优收缩权重 w。
+    将模型预测向煤种均值收缩: pred = w * oof_pred + (1-w) * coal_mean
     """
-    best_w, best_rmse = 1.0, float('inf')
-    for w in np.linspace(0.0, 1.0, 21):
-        blended = w * np.array(oof_preds) + (1 - w) * coal_mean
-        rmse    = float(np.sqrt(np.mean((blended - np.array(oof_true)) ** 2)))
+    batch_oof = aggregate_to_batch(oof_preds, groups)
+    batch_tgt = aggregate_to_batch(targets, groups)
+    best_w, best_rmse = 1.0, float("inf")
+    for w in w_candidates:
+        shrunk = {k: w * batch_oof[k] + (1 - w) * coal_mean for k in batch_oof}
+        rmse = np.sqrt(np.mean([(shrunk[k] - batch_tgt[k]) ** 2 for k in batch_tgt]))
         if rmse < best_rmse:
             best_rmse, best_w = rmse, w
     return best_w, best_rmse
 
 
-# ── 单煤种训练 ────────────────────────────────────────────────────────────────
+# ── 两阶段训练 ────────────────────────────────────────────────────────────────
 
-def train_coal_model(coal_type, train_data):
+def train_coal_model(coal_type, data, embedder=None):
     """
-    训练某煤种的两阶段模型，返回预测所需的全部参数。
+    对单个煤种训练两阶段模型。
 
-    输出 dict 包含:
-        spec_scalers  : (scaler_spec, pca, scaler_hand)
-        aux_models    : {辅助指标名: RidgeCV 或 None}
-        scaler_s2     : Stage2 的特征标准化器
-        final_model   : Stage2 最终 RidgeCV
-        coal_mean     : 训练集发热量均值（收缩锚点）
-        shrink_w      : 收缩权重 w（1.0 = 不收缩）
-        cv_rmse       : 交叉验证 RMSE
+    参数:
+        coal_type: 煤种名
+        data: 由 load_coal_spectra 返回的数据字典
+        embedder: 预训练的嵌入模型 (AE/MAE/VAE/Contrastive)
+                  不传时使用 PCA (默认)
+
+    返回:
+        dict: 包含所有模型组件和 CV-RMSE
     """
-    y          = train_data['targets']
-    aux        = train_data['aux']
-    groups     = train_data['groups']
-    n_batches  = train_data['n_batches']
-    coal_mean  = float(y.mean())
+    n_batches = data['n_batches']
+    groups    = data['groups']
+    targets   = data['targets']
+    aux_tgts  = data['aux']
 
-    print(f"\n  [{coal_type}]  {n_batches}批次  {len(y)}条光谱  "
-          f"Q={y.min():.0f}~{y.max():.0f}")
+    print(f"\n  [{coal_type}] 构建特征矩阵...")
+    X_spec, scaler_spec, embedder, scaler_hand = build_feature_matrix(
+        data, n_batches,
+        scaler_spec=None, embedder=embedder, scaler_hand=None, fit=True)
 
-    # 光谱 → 特征矩阵（训练集 fit）
-    X_spec, scaler_spec, pca, scaler_hand = build_feature_matrix(
-        train_data, n_batches, fit=True)
+    print(f"  [{coal_type}] 特征矩阵形状: {X_spec.shape}")
 
-    splits = get_cv_splits(groups, n_batches)
-
-    # ── Stage 1: 光谱 → 辅助指标 (OOF) ────────────────────────────────────
-    aux_models        = {}
-    predicted_aux_oof = np.zeros_like(aux, dtype=np.float32)
-
+    # ── Stage 1: 辅助指标回归 ─────────────────────────────────────────
+    print(f"  [{coal_type}] Stage 1: 辅助指标回归...")
+    aux_models = {}
     for col_idx, col_name in enumerate(AUX_COLS):
-        y_aux = aux[:, col_idx]
-
-        # 辅助指标有缺失时退化为用均值填充
-        if np.isnan(y_aux).any():
-            predicted_aux_oof[:, col_idx] = float(np.nanmean(y_aux))
-            aux_models[col_name] = None
+        y_aux = aux_tgts[:, col_idx]
+        valid = ~np.isnan(y_aux)
+        if valid.sum() < 5:
+            print(f"    ...跳过 {col_name} (有效样本={valid.sum()})")
             continue
+        model = RidgeCV(alphas=ALPHAS, scoring="neg_mean_squared_error")
+        model.fit(X_spec[valid], y_aux[valid])
+        aux_models[col_name] = model
 
-        m = RidgeCV(alphas=ALPHAS)
-        oof = np.zeros(len(y_aux))
-        for tr_idx, val_idx in splits:
-            m.fit(X_spec[tr_idx], y_aux[tr_idx])
-            oof[val_idx] = m.predict(X_spec[val_idx])
-        predicted_aux_oof[:, col_idx] = oof
+    # ── Stage 2: 发热量回归（OOF 预测辅助指标） ──────────────────────
+    print(f"  [{coal_type}] Stage 2: 发热量回归 + 均值收缩...")
 
-        m.fit(X_spec, y_aux)   # 全量重新拟合，存入 aux_models 供推理用
-        aux_models[col_name] = m
+    cv_splits = get_cv_splits(groups, n_batches)
+    oof_preds = np.zeros(len(targets), dtype=np.float32)
+    s2_models = []
 
-    # ── Stage 2: [光谱特征 + 预测辅助指标] → 发热量 ──────────────────────
-    X_s2      = np.hstack([X_spec, predicted_aux_oof])
+    for train_idx, val_idx in cv_splits:
+        # Stage 1 在训练折上重训辅助模型
+        aux_inner = {}
+        for col_idx, col_name in enumerate(AUX_COLS):
+            y_aux = aux_tgts[train_idx, col_idx]
+            valid = ~np.isnan(y_aux)
+            if valid.sum() < 5:
+                continue
+            m = RidgeCV(alphas=ALPHAS, scoring="neg_mean_squared_error")
+            m.fit(X_spec[train_idx][valid], y_aux[valid])
+            aux_inner[col_name] = m
+
+        # Stage 1 预测验证折的辅助指标
+        pred_aux_val = np.zeros((len(val_idx), len(AUX_COLS)), dtype=np.float32)
+        for col_idx, col_name in enumerate(AUX_COLS):
+            m = aux_inner.get(col_name)
+            if m is not None:
+                pred_aux_val[:, col_idx] = m.predict(X_spec[val_idx])
+
+        # Stage 2 输入: 光谱特征 + 验证折的辅助指标预测
+        X_s2_val = np.hstack([X_spec[val_idx], pred_aux_val])
+        y_s2_val = targets[val_idx]
+
+        # Stage 2 在训练折上训练
+        pred_aux_train = np.zeros((len(train_idx), len(AUX_COLS)), dtype=np.float32)
+        for col_idx, col_name in enumerate(AUX_COLS):
+            m = aux_inner.get(col_name)
+            if m is not None:
+                pred_aux_train[:, col_idx] = m.predict(X_spec[train_idx])
+        X_s2_train = np.hstack([X_spec[train_idx], pred_aux_train])
+        y_s2_train = targets[train_idx]
+
+        scaler_s2 = StandardScaler()
+        X_s2_train_scaled = scaler_s2.fit_transform(np.nan_to_num(X_s2_train))
+        X_s2_val_scaled   = scaler_s2.transform(np.nan_to_num(X_s2_val))
+
+        model_s2 = RidgeCV(alphas=ALPHAS, scoring="neg_mean_squared_error")
+        model_s2.fit(X_s2_train_scaled, y_s2_train)
+        oof_preds[val_idx] = model_s2.predict(X_s2_val_scaled)
+        s2_models.append((scaler_s2, model_s2))
+
+    # ── 均值收缩 ─────────────────────────────────────────────────────────
+    coal_mean = float(targets.mean())
+    w_candidates = np.linspace(0.1, 1.0, 10)
+    best_w, shrink_rmse = _search_shrink_w(oof_preds, targets, groups, coal_mean, w_candidates)
+
+    cv_oof = aggregate_to_batch(oof_preds, groups)
+    cv_tgt = aggregate_to_batch(targets, groups)
+    cv_rmse = float(np.sqrt(np.mean([(cv_oof[k] - cv_tgt[k]) ** 2 for k in cv_tgt])))
+    print(f"  [{coal_type}] CV-RMSE={cv_rmse:.2f}, 收缩w={best_w:.2f}")
+
+    # ── 用全量数据训练最终模型 ────────────────────────────────────────
     scaler_s2 = StandardScaler()
-    X_s2      = scaler_s2.fit_transform(np.nan_to_num(X_s2))
-
-    # OOF 批次预测（用于计算 CV-RMSE 和收缩权重）
-    oof_batch_preds, oof_batch_true, batch_rmses = [], [], []
-
-    for tr_idx, val_idx in splits:
-        m2 = RidgeCV(alphas=ALPHAS)
-        m2.fit(X_s2[tr_idx], y[tr_idx])
-        val_pred   = m2.predict(X_s2[val_idx])
-        val_groups = groups[val_idx]
-
-        fold_se = []
-        for bg in np.unique(val_groups):
-            mask   = val_groups == bg
-            true_q = float(y[val_idx][mask][0])
-            pred_q = float(np.median(val_pred[mask]))
-            oof_batch_preds.append(pred_q)
-            oof_batch_true.append(true_q)
-            fold_se.append((true_q - pred_q) ** 2)
-        batch_rmses.append(float(np.sqrt(np.mean(fold_se))))
-
-    cv_rmse_raw = float(np.mean(batch_rmses))
-
-    # 小批次煤种: 搜索最优收缩权重
-    best_w = 1.0
-    if n_batches <= SMALL_BATCH_THRESHOLD:
-        best_w, cv_rmse_shrunk = find_best_shrinkage(
-            oof_batch_preds, oof_batch_true, coal_mean)
-        cv_rmse = cv_rmse_shrunk
-        print(f"    Stage2 CV-RMSE: raw={cv_rmse_raw:.2f}  "
-              f"shrunk={cv_rmse_shrunk:.2f}  w={best_w:.2f}")
-    else:
-        cv_rmse = cv_rmse_raw
-        print(f"    Stage2 CV-RMSE: {cv_rmse:.2f} ± {np.std(batch_rmses):.2f}")
-
-    # 全量数据重新拟合最终模型
-    final_model = RidgeCV(alphas=ALPHAS)
-    final_model.fit(X_s2, y)
-    print(f"    最优正则化 alpha: {final_model.alpha_:.1f}")
+    pred_aux_all = np.zeros((len(targets), len(AUX_COLS)), dtype=np.float32)
+    for col_idx, col_name in enumerate(AUX_COLS):
+        m = aux_models.get(col_name)
+        if m is not None:
+            pred_aux_all[:, col_idx] = m.predict(X_spec)
+    X_s2_all   = np.hstack([X_spec, pred_aux_all])
+    X_s2_all   = scaler_s2.fit_transform(np.nan_to_num(X_s2_all))
+    final_model = RidgeCV(alphas=ALPHAS, scoring="neg_mean_squared_error")
+    final_model.fit(X_s2_all, targets)
 
     return {
-        'spec_scalers': (scaler_spec, pca, scaler_hand),
+        'spec_scalers': (scaler_spec, embedder, scaler_hand),
         'aux_models':   aux_models,
         'scaler_s2':    scaler_s2,
         'final_model':  final_model,
@@ -183,7 +199,7 @@ def predict_coal(coal_type, test_data, model_dict):
     推理流程与训练流程一一对应:
       光谱 → [Stage1] → 预测辅助指标 → [Stage2] → 发热量 → 批次聚合
     """
-    scaler_spec, pca, scaler_hand = model_dict['spec_scalers']
+    scaler_spec, embedder, scaler_hand = model_dict['spec_scalers']
     aux_models  = model_dict['aux_models']
     scaler_s2   = model_dict['scaler_s2']
     final_model = model_dict['final_model']
@@ -192,7 +208,7 @@ def predict_coal(coal_type, test_data, model_dict):
 
     X_spec = build_feature_matrix(
         test_data, n_batches=None,
-        scaler_spec=scaler_spec, pca=pca, scaler_hand=scaler_hand,
+        scaler_spec=scaler_spec, embedder=embedder, scaler_hand=scaler_hand,
         fit=False)
 
     pred_aux = np.zeros((len(test_data['spectra']), len(AUX_COLS)), dtype=np.float32)
