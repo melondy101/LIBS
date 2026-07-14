@@ -6,15 +6,14 @@ LIBS 光谱特征分三层:
   2. 谱线特征   — 关键元素谱线积分（绝对值 & 相对归一化）
   3. 物理比值   — 可燃元素/灰分比，H/C 比等
 
-三层拼接后进行 PCA 降维 + 标准化，作为 Ridge 模型的输入。
+三层拼接后经过嵌入降维 + 标准化，作为 Ridge 模型的输入。
 """
 
 import numpy as np
 from scipy.stats import skew, kurtosis, entropy as scipy_entropy
-from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
-from config import KEY_LINES, N_PCA_MAX, RANDOM_STATE
+from config import KEY_LINES, RANDOM_STATE
 
 
 # ── 谱线积分 ──────────────────────────────────────────────────────────────────
@@ -35,7 +34,7 @@ def spectrum_features(wl, inten):
     从一条光谱提取三层特征。
 
     返回:
-        inorm  (D,)   : 强度归一化（用于 PCA）
+        inorm  (D,)   : 强度归一化（用于嵌入降维）
         stats  (17,)  : 统计特征
         labs   (11,)  : 谱线绝对积分
         lrel   (11,)  : 谱线相对积分
@@ -68,7 +67,6 @@ def spectrum_features(wl, inten):
     lrel = labs / total   # 相对强度（消除光谱总能量差异）
 
     # 物理比值: 可燃元素 vs 灰分元素
-    # 索引: C=0, H=1, O=2, N=3 | Ca=4, Ca2=5, Mg=6, Al=7, Si=8, Fe=9, Na=10
     comb_sum = labs[[0, 1, 2, 3]].sum()                        # 可燃元素
     ash_sum  = labs[[4, 5, 6, 7, 8, 9]].sum() + 1e-8          # 灰分元素
     rats = np.array([
@@ -86,7 +84,7 @@ def spectrum_features(wl, inten):
 def compute_features(data):
     """
     对 data_dict 中所有光谱计算特征，原地填充 stats/labs/lrel/rats 字段。
-    同时返回归一化光谱矩阵（用于 PCA）。
+    同时返回归一化光谱矩阵（用于嵌入降维）。
     """
     raw_spectra = data['spectra']
     inorms, stats_list, labs_list, lrel_list, rats_list = [], [], [], [], []
@@ -111,38 +109,36 @@ def compute_features(data):
     return inorm_mat
 
 
-# ── PCA + 拼接 ────────────────────────────────────────────────────────────────
+# ── 嵌入降维 + 拼接 ──────────────────────────────────────────────────────────
 
 def build_feature_matrix(data, n_batches,
-                         scaler_spec=None, pca=None, scaler_hand=None, fit=True):
+                         scaler_spec=None, embedder=None, scaler_hand=None, fit=True):
     """
-    构建最终特征矩阵: [PCA(归一化光谱)] + [手工特征]。
+    构建最终特征矩阵: [嵌入降维(归一化光谱)] + [手工特征]。
 
-    fit=True  : 用训练数据拟合 scaler/PCA，返回 (X, scaler_spec, pca, scaler_hand)
-    fit=False : 用已拟合的 scaler/PCA 变换测试数据，返回 X
+    embedder: 对象必须实现 .fit(X) / .transform(X) / .fit_transform(X)
+              (PCA、AE、MAE、VAE、Contrastive 均可)
 
-    参数:
-        n_batches: 批次数，用于限制 PCA 维度（不能超过样本数-1）
+    fit=True  : 用训练数据拟合 scaler/embedder，返回 (X, scaler_spec, embedder, scaler_hand)
+    fit=False : 用已拟合的 scaler/embedder 变换测试数据，返回 X
     """
     inorm_mat = compute_features(data)
 
     if fit:
         scaler_spec = StandardScaler()
         spec_scaled = scaler_spec.fit_transform(inorm_mat)
-        n_pca = min(N_PCA_MAX, n_batches - 1, inorm_mat.shape[0] - 1)
-        pca = PCA(n_components=n_pca, random_state=RANDOM_STATE)
-        spec_pca = pca.fit_transform(spec_scaled)
+        spec_embed = embedder.fit_transform(spec_scaled)
     else:
-        spec_pca = pca.transform(scaler_spec.transform(inorm_mat))
+        spec_embed = embedder.transform(scaler_spec.transform(inorm_mat))
 
     # 拼接手工特征
     hand_feats = np.hstack([data['stats'], data['labs'], data['lrel'], data['rats']])
-    X = np.hstack([spec_pca, hand_feats])
+    X = np.hstack([spec_embed, hand_feats])
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
     if fit:
         scaler_hand = StandardScaler()
         X = scaler_hand.fit_transform(X)
-        return X, scaler_spec, pca, scaler_hand
+        return X, scaler_spec, embedder, scaler_hand
     else:
         return scaler_hand.transform(X)
