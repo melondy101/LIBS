@@ -186,17 +186,23 @@ def train_coal_model(coal_type, train_data, fold_mixup_config=None,
         'coal_mean':    coal_mean,
         'shrink_w':     best_w,
         'cv_rmse':      cv_rmse,
+        'perturb_cfg':  perturb_cfg,
     }
 
 
 # ── 单煤种推理 ────────────────────────────────────────────────────────────────
 
-def predict_coal(coal_type, test_data, model_dict):
+def predict_coal(coal_type, test_data, model_dict, perturb_cfg=None):
     """
     对某煤种的测试批次做推理，返回 {批次名: 预测发热量} 字典。
     推理流程与训练流程一一对应:
       光谱 → [Stage1] → 预测辅助指标 → [Stage2] → 发热量 → 批次聚合
+
+    参数:
+        perturb_cfg: 与训练时一致的扰动配置。None 时从 model_dict 读取。
     """
+    if perturb_cfg is None:
+        perturb_cfg = model_dict.get('perturb_cfg')
     scaler_spec, pca, scaler_hand = model_dict['spec_scalers']
     aux_models  = model_dict['aux_models']
     scaler_s2   = model_dict['scaler_s2']
@@ -207,7 +213,7 @@ def predict_coal(coal_type, test_data, model_dict):
     X_spec = build_feature_matrix(
         test_data, n_batches=None,
         scaler_spec=scaler_spec, pca=pca, scaler_hand=scaler_hand,
-        fit=False)
+        fit=False, perturb_cfg=perturb_cfg)
 
     pred_aux = np.zeros((len(test_data['spectra']), len(AUX_COLS)), dtype=np.float32)
     for col_idx, col_name in enumerate(AUX_COLS):

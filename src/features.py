@@ -138,7 +138,7 @@ def build_feature_matrix(data, n_batches,
 
     参数:
         n_batches: 批次数，用于限制 PCA 维度（不能超过样本数-1）
-        perturb_cfg: 训练时扰动配置，fit=True 时生效
+        perturb_cfg: 扰动配置（训练/推理均传入，保证特征空间一致）
     """
     inorm_mat = compute_features(data, perturb_cfg=perturb_cfg)
 

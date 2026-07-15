@@ -201,7 +201,8 @@ def main():
         if test_data is None or len(test_data['spectra']) == 0:
             print(f"  [{coal_type}] 无测试数据")
             continue
-        bp = predict_coal(coal_type, test_data, models[coal_type])
+        bp = predict_coal(coal_type, test_data, models[coal_type],
+                               perturb_cfg=perturb_cfg)
         all_preds.update(bp)
 
     print("\n  预测结果:")
