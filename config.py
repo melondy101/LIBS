@@ -57,5 +57,21 @@ ALPHAS = [1.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0]
 
 # 批次数 ≤ 此值时，对Stage2预测做均值收缩
 SMALL_BATCH_THRESHOLD = 10
+# ── Boltzmann 等离子体温度 ─────────────────────────────────────────────────────
+# 启用 Boltzmann 温度作为额外特征
+BOLTZMANN_ENABLE = True
 
+# 只使用高质量温度 (R2 >= 0.6, n_lines >= 4); False=全部可用温度(含低质量)
+BOLTZMANN_ONLY_QUALITY = False
 
+# Boltzmann 图 Fe I 谱线: (元素, 中心波长nm, 半窗口nm, 上能级 E_i(eV), log(gf))
+# 数据来源: NIST ASD (https://physics.nist.gov/asd), Fe I 370-440nm 区间的强线
+# 覆盖 3.3-5.5 eV 的上能级范围, 保证拟合稳健性
+BOLTZMANN_LINES = [
+    ("Fe", 371.99, 0.8, 3.33, -0.43),
+    ("Fe", 374.95, 0.8, 4.22,  0.39),
+    ("Fe", 382.04, 0.8, 4.10,  0.41),
+    ("Fe", 404.58, 0.8, 4.55,  0.28),
+    ("Fe", 406.36, 0.8, 4.61,  0.31),
+    ("Fe", 438.35, 1.0, 4.35,  0.22),   # 与 KEY_LINES["Fe"] 对应
+]

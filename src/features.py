@@ -15,7 +15,9 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
 from config import KEY_LINES, N_PCA_MAX, RANDOM_STATE
+from config import BOLTZMANN_ENABLE
 from src.perturb import perturb_spectrum
+from src.boltzmann import compute_boltzmann_feature
 
 
 # ── 谱线积分 ──────────────────────────────────────────────────────────────────
@@ -33,7 +35,7 @@ def line_integral(wl, inten, center_nm, halfwin_nm):
 
 def spectrum_features(wl, inten, perturb_cfg=None):
     """
-    从一条光谱提取三层特征。
+    从一条光谱提取三层特征 + Boltzmann 等离子体温度。
 
     参数:
         wl:   波长数组
@@ -89,29 +91,36 @@ def spectrum_features(wl, inten, perturb_cfg=None):
         labs[1] / (labs[0] + 1e-8),        # H/C
     ], dtype=np.float32)
 
-    return inten_norm, stats, labs, lrel, rats
+    # 等离子体温度 (Boltzmann 图法, 单条光谱)
+    if BOLTZMANN_ENABLE:
+        bt = compute_boltzmann_feature(wl, inten)
+    else:
+        bt = (np.nan, 0.0, 0.0)
+
+    return inten_norm, stats, labs, lrel, rats, bt
 
 
 # ── 批量特征计算 ──────────────────────────────────────────────────────────────
 
 def compute_features(data, perturb_cfg=None):
     """
-    对 data_dict 中所有光谱计算特征，原地填充 stats/labs/lrel/rats 字段。
+    对 data_dict 中所有光谱计算特征，原地填充 stats/labs/lrel/rats/boltzmann 字段。
     同时返回归一化光谱矩阵（用于 PCA）。
 
     参数:
         perturb_cfg: 传给 spectrum_features 的扰动配置，train 时传入
     """
     raw_spectra = data['spectra']
-    inorms, stats_list, labs_list, lrel_list, rats_list = [], [], [], [], []
+    inorms, stats_list, labs_list, lrel_list, rats_list, boltzmann_list = [], [], [], [], [], []
 
     for wl, inten in raw_spectra:
-        inorm, stats, labs, lrel, rats = spectrum_features(wl, inten, perturb_cfg)
+        inorm, stats, labs, lrel, rats, bt = spectrum_features(wl, inten, perturb_cfg)
         inorms.append(inorm)
         stats_list.append(stats)
         labs_list.append(labs)
         lrel_list.append(lrel)
         rats_list.append(rats)
+        boltzmann_list.append(bt)
 
     # 裁剪到最短公共波长（不同仪器/文件行数可能略有差异）
     min_len = min(len(s) for s in inorms)
@@ -121,6 +130,7 @@ def compute_features(data, perturb_cfg=None):
     data['labs']  = np.array(labs_list)
     data['lrel']  = np.array(lrel_list)
     data['rats']  = np.array(rats_list)
+    data['boltzmann'] = np.array(boltzmann_list, dtype=np.float32)
 
     return inorm_mat
 
@@ -131,7 +141,7 @@ def build_feature_matrix(data, n_batches,
                          scaler_spec=None, pca=None, scaler_hand=None,
                          fit=True, perturb_cfg=None):
     """
-    构建最终特征矩阵: [PCA(归一化光谱)] + [手工特征]。
+    构建最终特征矩阵: [PCA(归一化光谱)] + [手工特征 + Boltzmann 温度]。
 
     fit=True  : 用训练数据拟合 scaler/PCA，返回 (X, scaler_spec, pca, scaler_hand)
     fit=False : 用已拟合的 scaler/PCA 变换测试数据，返回 X
@@ -151,8 +161,9 @@ def build_feature_matrix(data, n_batches,
     else:
         spec_pca = pca.transform(scaler_spec.transform(inorm_mat))
 
-    # 拼接手工特征
-    hand_feats = np.hstack([data['stats'], data['labs'], data['lrel'], data['rats']])
+    # 拼接手工特征 + Boltzmann 温度
+    boltz_feat = data.get('boltzmann', np.zeros((len(data['spectra']), 6)))
+    hand_feats = np.hstack([data['stats'], data['labs'], data['lrel'], data['rats'], boltz_feat])
     X = np.hstack([spec_pca, hand_feats])
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -194,8 +205,9 @@ def build_feature_matrix_encoder(data, n_batches, encoder, fit=True, scaler_hand
     with torch.no_grad():
         latent = encoder.encode(torch.from_numpy(inorm_mat).to(PT_DEVICE)).cpu().numpy()
 
-    # 拼接手工特征
-    hand_feats = np.hstack([data['stats'], data['labs'], data['lrel'], data['rats']])
+    # 拼接手工特征 + Boltzmann 温度
+    boltz_feat = data.get('boltzmann', np.zeros((len(data['spectra']), 6)))
+    hand_feats = np.hstack([data['stats'], data['labs'], data['lrel'], data['rats'], boltz_feat])
     X = np.hstack([latent, hand_feats])
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -205,3 +217,4 @@ def build_feature_matrix_encoder(data, n_batches, encoder, fit=True, scaler_hand
         return X, scaler_hand
     else:
         return scaler_hand.transform(X)
+
