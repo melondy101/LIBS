@@ -14,8 +14,9 @@ from scipy.stats import skew, kurtosis, entropy as scipy_entropy
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
-from config import KEY_LINES, N_PCA_MAX, RANDOM_STATE
+from config import KEY_LINES, N_PCA_MAX, RANDOM_STATE, CFLIBS_ENABLE, CFLIBS_MODE, CFLIBS_ELEMENTS
 from src.perturb import perturb_spectrum
+from src.cflibs import compute_concentrations, concentration_vector
 
 
 # ── 谱线积分 ──────────────────────────────────────────────────────────────────
@@ -120,7 +121,23 @@ def compute_features(data, perturb_cfg=None):
     data['stats'] = np.array(stats_list)
     data['labs']  = np.array(labs_list)
     data['lrel']  = np.array(lrel_list)
+    data['stats'] = np.array(stats_list)
+    data['labs']  = np.array(labs_list)
+    data['lrel']  = np.array(lrel_list)
     data['rats']  = np.array(rats_list)
+
+    # ── 可选 CF-LIBS 定量浓度 ──
+    if CFLIBS_ENABLE:
+        cflibs_list = []
+        for wl_spec, inten_spec in raw_spectra:
+            conc = compute_concentrations(wl_spec, inten_spec)
+            if conc is not None:
+                _ = conc.pop('_diagnostics', None)
+            vec = concentration_vector(conc, CFLIBS_ELEMENTS)
+            cflibs_list.append(vec)
+        data['cflibs'] = np.array(cflibs_list, dtype=np.float32)
+    else:
+        data['cflibs'] = None
 
     return inorm_mat
 
@@ -151,8 +168,14 @@ def build_feature_matrix(data, n_batches,
     else:
         spec_pca = pca.transform(scaler_spec.transform(inorm_mat))
 
-    # 拼接手工特征
-    hand_feats = np.hstack([data['stats'], data['labs'], data['lrel'], data['rats']])
+    # 拼接手工特征（可选包含 CF-LIBS 浓度）
+    hand_parts = [data['stats'], data['labs'], data['lrel'], data['rats']]
+    if CFLIBS_ENABLE and data.get('cflibs') is not None:
+        if CFLIBS_MODE == 'concat':
+            hand_parts.append(data['cflibs'])
+        elif CFLIBS_MODE == 'replace':
+            hand_parts = [data['stats'], data['cflibs'], data['rats']]
+    hand_feats = np.hstack(hand_parts)
     X = np.hstack([spec_pca, hand_feats])
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -194,8 +217,14 @@ def build_feature_matrix_encoder(data, n_batches, encoder, fit=True, scaler_hand
     with torch.no_grad():
         latent = encoder.encode(torch.from_numpy(inorm_mat).to(PT_DEVICE)).cpu().numpy()
 
-    # 拼接手工特征
-    hand_feats = np.hstack([data['stats'], data['labs'], data['lrel'], data['rats']])
+    # 拼接手工特征（可选包含 CF-LIBS 浓度）
+    hand_parts = [data['stats'], data['labs'], data['lrel'], data['rats']]
+    if CFLIBS_ENABLE and data.get('cflibs') is not None:
+        if CFLIBS_MODE == 'concat':
+            hand_parts.append(data['cflibs'])
+        elif CFLIBS_MODE == 'replace':
+            hand_parts = [data['stats'], data['cflibs'], data['rats']]
+    hand_feats = np.hstack(hand_parts)
     X = np.hstack([latent, hand_feats])
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 

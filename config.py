@@ -45,6 +45,11 @@ KEY_LINES = {
 # PCA 最大保留维数（防止小批次煤种过拟合）
 N_PCA_MAX = 30
 
+# ── CF-LIBS 配置 ────────────────────────────────────────────────────────────
+CFLIBS_ENABLE = False          # 是否启用 CF-LIBS 定量浓度特征
+CFLIBS_MODE  = "concat"        # "concat"=拼接, "replace"=替换线积分
+CFLIBS_ELEMENTS = ["C","H","O","N","Ca","Mg","Al","Si","Fe","Na","K"]
+
 # 特征提取方式（在 src/feature_extractors.py 的 REGISTRY 中注册）
 # 可选: "pca" / "contrastive_8|16|32" / "ae_8|16|32" / "mae_8|16|32"
 FEATURE_EXTRACTOR = "contrastive_32"
