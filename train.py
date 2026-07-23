@@ -26,6 +26,7 @@ from src.model    import train_coal_model, predict_coal
 from src.submit   import pack_submission
 from src.experiment_tracker import log_experiment
 from src.augment  import augment_data
+from src.anomaly_detect import filter_anomalies
 
 
 def main():
@@ -152,6 +153,15 @@ def main():
         if train_data is None or train_data['n_batches'] == 0:
             print(f"\n  [{coal_type}] 未找到训练数据，跳过")
             continue
+
+        # ── 异常检测（批次内污染光谱剔除） ──
+        from config import ANOMALY_DETECTION, ANOMALY_CORR_MAD, ANOMALY_INTENSITY_Z, ANOMALY_RATIO_Z
+        if ANOMALY_DETECTION:
+            filter_anomalies(train_data,
+                             corr_mad=ANOMALY_CORR_MAD,
+                             intensity_z=ANOMALY_INTENSITY_Z,
+                             ratio_z=ANOMALY_RATIO_Z,
+                             verbose=True)
 
         # ── 数据增强（仅在训练时，保持 GroupKFold 结构） ──
         do_augment = (args.augment != "none")

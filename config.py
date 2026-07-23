@@ -59,3 +59,10 @@ ALPHAS = [1.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0]
 SMALL_BATCH_THRESHOLD = 10
 
 
+
+# ── 异常检测 ──────────────────────────────────────────────────────────────────
+# 批次内光谱异常检测，满足任一条件即剔除
+ANOMALY_DETECTION = True       # 开关
+ANOMALY_CORR_MAD  = 3.0       # 谱形相关性 MAD 倍数阈值（低于 median - n*MAD 视为异常）
+ANOMALY_INTENSITY_Z = 3.0     # 原始总强度 z-score 阈值
+ANOMALY_RATIO_Z    = 3.0      # C/H 线强比 z-score 阈值
